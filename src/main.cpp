@@ -102,6 +102,15 @@ static void readSensor() {
 // ---------------------------------------------------------------------------
 static int16_t anchors[8][INTERP_RES];
 
+// Per-output-position interpolation data. The 8->42 geometry is fixed, so the
+// per-pixel index/frac division-modulo is precomputed once here (in setup());
+// the frame builder only does a table lookup plus a single Q8 multiply+shift.
+struct InterpPos {
+  uint8_t index;  // source sensor index (0..6; index+1 is the segment end)
+  uint8_t weight; // Q8 fixed-point fraction toward the next sensor (0..255)
+};
+static InterpPos interp[INTERP_RES];
+
 void buildFrame() {
   // 1. Interpolate each sensor row of 8 values up to INTERP_RES columns.
   //    (vertical mirror to match the ROTATE180 data orientation)
@@ -109,13 +118,10 @@ void buildFrame() {
     const int16_t *src = &pixelsQ4[row * 8];
     int16_t *dst = anchors[7 - row];
     for (int c = 0; c < INTERP_RES; c++) {
-      int sLow = c / INTERP_QUOT;
-      int sHigh = sLow + 1;
-      if (sHigh > 7) sHigh = 7;
-      int frac = c % INTERP_QUOT;
-      dst[c] = (int16_t)(src[sLow] +
-                         ((int32_t)(src[sHigh] - src[sLow]) * frac) /
-                             INTERP_QUOT);
+      uint8_t sLow = interp[c].index;
+      uint8_t sHigh = sLow + (sLow < 7);
+      dst[c] = (int16_t)(src[sLow] + (((int32_t)(src[sHigh] - src[sLow]) *
+                                       interp[c].weight) >> 8));
     }
   }
 
@@ -123,15 +129,14 @@ void buildFrame() {
   //    Rows are mirrored top/bottom (up/down came out flipped); columns keep
   //    their direction because the row mirror alone fixes orientation.
   for (int r = 0; r < INTERP_RES; r++) {
-    int a = r / INTERP_QUOT;
-    int b = a + 1;
-    if (b > 7) b = 7;
-    int frac = r % INTERP_QUOT;
+    uint8_t a = interp[r].index;
+    uint8_t b = a + (a < 7);
+    int w = interp[r].weight;
     const int16_t *lo = anchors[a];
     const int16_t *hi = anchors[b];
     uint16_t *frow = frame[INTERP_RES - 1 - r];
     for (int c = 0; c < INTERP_RES; c++) {
-      int32_t t = lo[c] + ((int32_t)(hi[c] - lo[c]) * frac) / INTERP_QUOT;
+      int32_t t = lo[c] + (((int32_t)(hi[c] - lo[c]) * w) >> 8);
       if (t < 0) t = 0;
       else if (t > MAX_TEMP_Q4) t = MAX_TEMP_Q4;
       frow[c] = colorLUT[t];
@@ -240,12 +245,19 @@ static void SetTempScale() {
   if (tMin < MinTempQ4 - 2 * Q4_SCALE || tMin > MinTempQ4 + 2 * Q4_SCALE) {
     MinTempQ4 = tMin;
   }
-  if (MaxTempQ4 - MinTempQ4 < 5 * Q4_SCALE) {
-    MaxTempQ4 = MinTempQ4 + 5 * Q4_SCALE;
-  }
+
+  // Clamp as a pair, then enforce the minimum 5C span LAST so the range can
+  // never collapse below 5*Q4_SCALE (updateColorLUT() divides by the range:
+  // a too-small range would make the ramp denominators 0 and trip an integer
+  // divide-by-zero -> exception/reboot on uniform hot scenes).
   if (MinTempQ4 < MIN_TEMP_Q4) MinTempQ4 = MIN_TEMP_Q4;
   if (MaxTempQ4 > MAX_TEMP_Q4) MaxTempQ4 = MAX_TEMP_Q4;
-  if (MaxTempQ4 <= MinTempQ4) MaxTempQ4 = MinTempQ4 + 5 * Q4_SCALE;
+  if (MaxTempQ4 - MinTempQ4 < 5 * Q4_SCALE) {
+    if (MinTempQ4 + 5 * Q4_SCALE > MAX_TEMP_Q4) {
+      MinTempQ4 = MAX_TEMP_Q4 - 5 * Q4_SCALE; // slide the pair down together
+    }
+    MaxTempQ4 = MinTempQ4 + 5 * Q4_SCALE;
+  }
 
   updateColorLUT();
 }
@@ -257,6 +269,12 @@ void setup() {
   // 90 deg counter-clockwise so the display + PCB fit the enclosure
   Display.setRotation(3);
   Display.fillScreen(TFT_BLACK);
+
+  // precompute the constant 8x8 -> INTERP_RES x INTERP_RES mapping
+  for (int i = 0; i < INTERP_RES; i++) {
+    interp[i].index = (uint8_t)(i / INTERP_QUOT);
+    interp[i].weight = (uint8_t)(((i % INTERP_QUOT) * 256) / INTERP_QUOT);
+  }
 
   // simple splash
   Display.setTextSize(2);
